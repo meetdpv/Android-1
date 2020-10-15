@@ -1,30 +1,75 @@
-FROM frolvlad/alpine-java
+FROM openjdk:8-jdk-slim
 
-WORKDIR project/
+# Install required packages:
+# - curl:            to download the Android SDK Tools
+# - git:             fetching sources occurs inside the container
+# - libgl1-mesa-glx: for Android emulator
+# - libpulse0:       for Android emulator
+# - openssh-client:  for Git-related operations
+# - procps:          for `ps`, required by Jenkins Docker Pipeline Plugin
+# - rsync:           to help sync Gradle caches
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        libgl1-mesa-glx \
+        libpulse0 \
+        openssh-client \
+        procps \
+        rsync \
+        unzip && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install Build Essentials
-RUN apt-get update \
-    && apt-get install build-essential -y
+# Create an android user/group, with Jenkins-compatible UID
+RUN groupadd --gid 1000 android && \
+    useradd --uid 1000 --gid 1000 --create-home android
 
-# Set Environment Variables
-ENV SDK_URL="https://dl.google.com/android/repository/sdk-tools-linux-3859397.zip" \
-    ANDROID_HOME="/usr/local/android-sdk" \
-    ANDROID_VERSION=29
+# Export ANDROID_HOME, so that other tools can find the SDK
+ENV ANDROID_HOME /opt/android/sdk
 
-# Download Android SDK
-RUN mkdir "$ANDROID_HOME" .android \
-    && cd "$ANDROID_HOME" \
-    && curl -o sdk.zip $SDK_URL \
-    && unzip sdk.zip \
-    && rm sdk.zip \
-    && mkdir "$ANDROID_HOME/licenses" || true \
-    && echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license" \
-    && yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses
+# Create the ANDROID_HOME directory for the android user
+RUN mkdir -p ${ANDROID_HOME} && \
+    chown -R android:android ${ANDROID_HOME}
 
-# Install Android Build Tool and Libraries
-RUN $ANDROID_HOME/tools/bin/sdkmanager --update
-RUN $ANDROID_HOME/tools/bin/sdkmanager "build-tools;29.0.2" \
-    "platforms;android-${ANDROID_VERSION}" \
-    "platform-tools"
+# Switch to the android user
+USER android
+ENV HOME /home/android
 
-CMD ["/bin/bash"]
+# Enable Java options for Docker
+ENV JAVA_TOOL_OPTIONS -XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap
+
+# Put the Android SDK Tools on the PATH
+ENV PATH=${ANDROID_HOME}/tools:${ANDROID_HOME}/emulator:${ANDROID_HOME}/cmdline-tools/tools/bin:${ANDROID_HOME}/platform-tools:${PATH}
+
+# Stop sdkmanager from complaining
+RUN mkdir ~/.android && touch ~/.android/repositories.cfg
+
+# Define the download URL and SHA-256 checksum of the Android SDK Tools;
+# both can be found at https://developer.android.com/studio/index.html#command-tools
+ARG ANDROID_SDK_URL=https://dl.google.com/android/repository/commandlinetools-linux-6200805_latest.zip
+ARG ANDROID_SDK_CHECKSUM=f10f9d5bca53cc27e2d210be2cbc7c0f1ee906ad9b868748d74d62e10f2c8275
+
+# Download the Android SDK Tools, verify the checksum, extract to ANDROID_HOME, then
+# remove everything but sdkmanager and its dependencies to keep the layer size small
+RUN curl --silent --show-error --fail --retry 1 --output /tmp/sdk.zip --location ${ANDROID_SDK_URL} && \
+    echo "${ANDROID_SDK_CHECKSUM}  /tmp/sdk.zip" > /tmp/checksum && \
+    sha256sum -c /tmp/checksum > /dev/null && \
+    unzip -q /tmp/sdk.zip -d ${ANDROID_HOME}/cmdline-tools && \
+    rm /tmp/checksum /tmp/sdk.zip
+
+# Accept all SDK licences
+RUN sdkmanager --verbose --update && \
+    yes | sdkmanager --licenses
+
+# Update the Android SDK Tools to the latest, and install the basics
+RUN sdkmanager --verbose \
+      tools \
+      platform-tools \
+      emulator
+
+# Install the desired platform version and Build Tools
+RUN sdkmanager --verbose --update && \
+    sdkmanager --verbose --install \
+    'platforms;android-29' \
+    'build-tools;29.0.3'
